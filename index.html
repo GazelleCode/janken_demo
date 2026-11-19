@@ -14,6 +14,7 @@
         <p class="eyebrow">ON-DEVICE CAMERA EXPERIMENT</p>
         <h1>JANKEN TIMING TEST</h1>
         <p id="app-status" class="app-status" role="status">認識エンジンを読み込んでいます…</p>
+        <p id="orientation-hint" class="orientation-hint">横画面での利用を推奨します</p>
       </header>
 
       <section class="camera-section" aria-label="カメラ映像と手の認識状態">
@@ -54,14 +55,19 @@
       <section class="controls" aria-label="測定コントロール">
         <button id="enable-camera" class="secondary-button" type="button">ENABLE CAMERA</button>
         <button id="start-test" class="start-button" type="button" disabled>START TEST</button>
+        <button id="auto-judge" class="auto-button" type="button" disabled>AUTO JUDGE</button>
         <button id="reset-test" class="secondary-button" type="button" disabled>RESET</button>
       </section>
 
       <section id="result-panel" class="result-panel" aria-live="polite" hidden>
-        <p class="result-label">MEASUREMENT COMPLETE</p>
+        <p id="result-label" class="result-label">MEASUREMENT COMPLETE</p>
         <div class="result-players">
           <div><span>PLAYER A</span><strong id="result-a-gesture">—</strong><b id="result-a-time">—</b></div>
           <div><span>PLAYER B</span><strong id="result-b-gesture">—</strong><b id="result-b-time">—</b></div>
+        </div>
+        <div class="judge-result">
+          <span>JANKEN RESULT</span>
+          <output id="winner-message">—</output>
         </div>
         <div class="difference-block">
           <span>TIME DIFFERENCE (B − A)</span>

@@ -10,6 +10,9 @@ const REQUESTED_WIDTH = 1280;
 const REQUESTED_HEIGHT = 720;
 const MIRROR_PREVIEW = true;
 const DEBUG_LOG_LIMIT = 40;
+// AUTO JUDGE arms on a visible janken motion, then waits for both hands to
+// become still and recognisable. The value is normalized hand-shape movement per frame.
+const AUTO_MOTION_THRESHOLD = 0.018;
 
 const GESTURE_NAMES = Object.freeze({
   Closed_Fist: "ROCK",
@@ -27,10 +30,11 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   video: $("camera"), overlay: $("overlay"), status: $("app-status"),
   placeholder: $("camera-placeholder"), countdown: $("countdown"),
-  enableCamera: $("enable-camera"), start: $("start-test"), reset: $("reset-test"),
+  enableCamera: $("enable-camera"), start: $("start-test"), auto: $("auto-judge"), reset: $("reset-test"),
   result: $("result-panel"), resultAGesture: $("result-a-gesture"),
   resultATime: $("result-a-time"), resultBGesture: $("result-b-gesture"),
-  resultBTime: $("result-b-time"), difference: $("time-difference"), laterMessage: $("later-message"),
+  resultBTime: $("result-b-time"), resultLabel: $("result-label"), winnerMessage: $("winner-message"),
+  difference: $("time-difference"), laterMessage: $("later-message"), orientationHint: $("orientation-hint"),
   cameraFps: $("camera-fps"), measuredFps: $("measured-fps"), frameInterval: $("frame-interval"),
   debugMode: $("debug-mode"), debugDetails: $("debug-details"), debugLog: $("debug-log"),
   player: {
@@ -48,9 +52,10 @@ let cameraStream;
 let cameraReady = false;
 let frameLoopStarted = false;
 let countdownRun = 0;
-let phase = "idle"; // idle | countdown | running | result
+let phase = "idle"; // idle | countdown | running | auto | result
 let goTimestamp = null;
 let measurement = { A: null, B: null };
+let autoMotionTriggered = false;
 let debugLines = [];
 let frameTimestamps = [];
 let lastFrameTimestamp = null;
@@ -58,6 +63,7 @@ let lastFrameTimestamp = null;
 function emptyTracker() {
   return {
     detected: false, gesture: "UNKNOWN", confidence: 0, centerX: null,
+    motionPoint: null, motion: 0,
     sequenceGesture: null, sequenceCount: 0, sequenceStartTimestamp: null, lastLocked: null,
   };
 }
@@ -151,6 +157,40 @@ function selectCandidateForPlayer(candidates, player) {
   })[0];
 }
 
+function updateMotion(track, candidate) {
+  const landmarks = candidate?.landmarks;
+  if (!landmarks?.length) {
+    track.motionPoint = null;
+    track.motion = 0;
+    return 0;
+  }
+  // Averaging the wrist and four fingertips catches both the normal janken
+  // arm movement and a hand shape changing while its wrist stays in place.
+  const anchorIndices = [0, 8, 12, 16, 20];
+  const points = anchorIndices.map((index) => landmarks[index]).filter(Boolean);
+  const anchor = points.reduce((sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }), { x: 0, y: 0 });
+  anchor.x /= points.length;
+  anchor.y /= points.length;
+  const previous = track.motionPoint;
+  const motion = previous ? Math.hypot(anchor.x - previous.x, anchor.y - previous.y) : 0;
+  track.motionPoint = anchor;
+  track.motion = motion;
+  return motion;
+}
+
+function startAutoCapture(timestamp) {
+  autoMotionTriggered = true;
+  goTimestamp = timestamp;
+  resetForGo();
+  setStatus("動きを検知しました。手形が止まり、3フレーム安定したら自動判定します。");
+}
+
+function winnerFor(aGesture, bGesture) {
+  if (aGesture === bGesture) return "DRAW — SAME HAND";
+  const aWins = { ROCK: "SCISSORS", SCISSORS: "PAPER", PAPER: "ROCK" };
+  return aWins[aGesture] === bGesture ? "PLAYER A WINS" : "PLAYER B WINS";
+}
+
 function updateStability(player, candidate, timestamp) {
   const track = trackers[player];
   if (!candidate || candidate.gesture === "UNKNOWN") {
@@ -173,7 +213,8 @@ function updateStability(player, candidate, timestamp) {
       confidence: candidate.confidence,
       timestamp: track.sequenceStartTimestamp,
     };
-    if (phase === "running" && !measurement[player]) {
+    const canRecord = phase === "running" || (phase === "auto" && autoMotionTriggered);
+    if (canRecord && !measurement[player]) {
       measurement[player] = { ...track.lastLocked };
       setStatus(`PLAYER ${player} を記録しました。もう一方の手を待っています。`);
       if (measurement.A && measurement.B) finishMeasurement();
@@ -216,7 +257,7 @@ function logDebugFrame(timestamp, candidates, selections) {
     ...candidates.map((candidate) => {
       const assigned = selections.A?.index === candidate.index ? "A" : selections.B?.index === candidate.index ? "B" : "outside";
       const tracker = assigned === "A" || assigned === "B" ? trackers[assigned] : null;
-      return `[${assigned}] hand=${candidate.index} wrist/screenX=${candidate.centerX.toFixed(3)} raw=${candidate.rawName} mapped=${candidate.gesture} confidence=${(candidate.confidence * 100).toFixed(1)}% streak=${tracker?.sequenceCount ?? 0}/${STABLE_FRAME_COUNT}\n  landmarks: ${landmarksForLog(candidate.landmarks)}`;
+      return `[${assigned}] hand=${candidate.index} wrist/screenX=${candidate.centerX.toFixed(3)} raw=${candidate.rawName} mapped=${candidate.gesture} confidence=${(candidate.confidence * 100).toFixed(1)}% motion=${(tracker?.motion ?? 0).toFixed(3)} streak=${tracker?.sequenceCount ?? 0}/${STABLE_FRAME_COUNT}\n  landmarks: ${landmarksForLog(candidate.landmarks)}`;
     }),
   ].join("\n");
   debugLines.unshift(output);
@@ -237,6 +278,12 @@ function processFrame(timestamp) {
       A: selectCandidateForPlayer(candidates, "A"),
       B: selectCandidateForPlayer(candidates, "B"),
     };
+    const motion = {
+      A: updateMotion(trackers.A, selections.A),
+      B: updateMotion(trackers.B, selections.B),
+    };
+    const autoMotionThisFrame = phase === "auto" && Object.values(motion).some((amount) => amount >= AUTO_MOTION_THRESHOLD);
+    if (phase === "auto" && !autoMotionTriggered && autoMotionThisFrame) startAutoCapture(timestamp);
 
     for (const player of ["A", "B"]) {
       const candidate = selections[player];
@@ -248,7 +295,9 @@ function processFrame(timestamp) {
       // A callback that was queued just before GO must not seed a post-GO
       // sequence, even on an unusually busy browser event loop.
       const eligibleForTiming = phase !== "running" || timestamp >= goTimestamp;
-      updateStability(player, eligibleForTiming ? candidate : null, timestamp);
+      const autoCandidate = autoMotionTriggered && !autoMotionThisFrame ? candidate : null;
+      const candidateForStability = phase === "auto" ? autoCandidate : candidate;
+      updateStability(player, eligibleForTiming ? candidateForStability : null, timestamp);
     }
     drawLandmarks(landmarkGroups, candidates);
     logDebugFrame(timestamp, candidates, selections);
@@ -299,9 +348,11 @@ async function startTest() {
   }
   const runId = ++countdownRun;
   phase = "countdown";
+  autoMotionTriggered = false;
   resetForGo();
   ui.result.hidden = true;
   ui.start.disabled = true;
+  ui.auto.disabled = true;
   ui.reset.disabled = false;
   updateAllPlayerUI();
 
@@ -327,7 +378,31 @@ async function startTest() {
   }, 700);
 }
 
+function startAutoJudge() {
+  if (!cameraReady || !recognizer) {
+    setStatus("先にカメラと認識エンジンを準備してください。", true);
+    return;
+  }
+  countdownRun += 1;
+  phase = "auto";
+  goTimestamp = null;
+  autoMotionTriggered = false;
+  resetForGo();
+  for (const player of ["A", "B"]) {
+    trackers[player].motionPoint = null;
+    trackers[player].motion = 0;
+  }
+  ui.countdown.hidden = true;
+  ui.result.hidden = true;
+  ui.start.disabled = true;
+  ui.auto.disabled = true;
+  ui.reset.disabled = false;
+  updateAllPlayerUI();
+  setStatus("AUTO JUDGE待機中: じゃんけんの動きを検知後、止まった手形を自動判定します。");
+}
+
 function finishMeasurement() {
+  const completedAutomatically = phase === "auto";
   phase = "result";
   ui.countdown.hidden = true;
   const a = measurement.A;
@@ -337,6 +412,9 @@ function finishMeasurement() {
   ui.resultATime.textContent = formatMs(a.timestamp - goTimestamp);
   ui.resultBGesture.textContent = b.gesture;
   ui.resultBTime.textContent = formatMs(b.timestamp - goTimestamp);
+  const winner = winnerFor(a.gesture, b.gesture);
+  ui.resultLabel.textContent = completedAutomatically ? "AUTO JUDGEMENT COMPLETE" : "MEASUREMENT COMPLETE";
+  ui.winnerMessage.textContent = winner;
   ui.difference.textContent = `${difference >= 0 ? "+" : ""}${formatMs(difference)}`;
   if (Math.abs(difference) < 0.05) {
     ui.laterMessage.textContent = "SAME CAPTURE FRAME (within displayed precision)";
@@ -346,21 +424,24 @@ function finishMeasurement() {
   }
   ui.result.hidden = false;
   ui.start.disabled = false;
+  ui.auto.disabled = false;
   ui.reset.disabled = false;
   updateAllPlayerUI();
-  setStatus("測定完了。RESETで次の測定を開始できます。");
+  setStatus(`${completedAutomatically ? "自動判定" : "測定"}完了: ${winner}。RESETで次の測定を開始できます。`);
 }
 
 function resetTest() {
   countdownRun += 1;
   phase = "idle";
   goTimestamp = null;
+  autoMotionTriggered = false;
   measurement = { A: null, B: null };
   resetLiveTrackers();
   ui.countdown.hidden = true;
   ui.countdown.classList.remove("go");
   ui.result.hidden = true;
   ui.start.disabled = !cameraReady;
+  ui.auto.disabled = !cameraReady;
   ui.reset.disabled = !cameraReady;
   updateAllPlayerUI();
   if (cameraReady) setStatus("リセットしました。START TESTで測定できます。");
@@ -408,6 +489,7 @@ async function enableCamera() {
     ui.placeholder.hidden = true;
     ui.enableCamera.textContent = "CAMERA READY";
     ui.start.disabled = false;
+    ui.auto.disabled = false;
     ui.reset.disabled = false;
     setStatus("カメラ準備完了。中央線の左右へ一人ずつ入ってください。");
     startFrameLoop();
@@ -457,9 +539,18 @@ async function initialiseRecognizer() {
   }
 }
 
+function updateOrientationHint() {
+  const landscape = window.matchMedia("(orientation: landscape)").matches;
+  ui.orientationHint.textContent = landscape
+    ? "LANDSCAPE READY — 左右のプレイヤーを中央線で分けてください"
+    : "横画面での利用を推奨します";
+  ui.orientationHint.classList.toggle("landscape", landscape);
+}
+
 function bindEvents() {
   ui.enableCamera.addEventListener("click", enableCamera);
   ui.start.addEventListener("click", startTest);
+  ui.auto.addEventListener("click", startAutoJudge);
   ui.reset.addEventListener("click", resetTest);
   ui.debugMode.addEventListener("change", () => {
     ui.debugDetails.hidden = !ui.debugMode.checked;
@@ -469,9 +560,14 @@ function bindEvents() {
       context?.clearRect(0, 0, canvas.width, canvas.height);
     }
   });
-  window.addEventListener("resize", resizeOverlay);
+  window.addEventListener("resize", () => {
+    resizeOverlay();
+    updateOrientationHint();
+  });
+  window.addEventListener("orientationchange", updateOrientationHint);
   ui.video.addEventListener("loadedmetadata", resizeOverlay);
 }
 
 bindEvents();
+updateOrientationHint();
 initialiseRecognizer();
