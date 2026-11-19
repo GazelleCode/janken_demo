@@ -10,9 +10,15 @@ const REQUESTED_WIDTH = 1280;
 const REQUESTED_HEIGHT = 720;
 const MIRROR_PREVIEW = true;
 const DEBUG_LOG_LIMIT = 40;
-// AUTO JUDGE arms on a visible janken motion, then waits for both hands to
-// become still and recognisable. The value is normalized hand-shape movement per frame.
-const AUTO_MOTION_THRESHOLD = 0.018;
+// AUTO JUDGE arms on visible janken motion, then uses adaptive settling rather
+// than requiring a perfectly motionless hand. All values are normalized to the frame.
+const AUTO_MOTION_START_FLOOR = 0.014;
+const AUTO_MOTION_HISTORY_SIZE = 24;
+const AUTO_SETTLE_WINDOW = 4;
+const AUTO_SETTLE_FRAME_COUNT = 3;
+const AUTO_SETTLE_NOISE_MULTIPLIER = 2.4;
+const AUTO_SETTLE_MIN_THRESHOLD = 0.005;
+const AUTO_SETTLE_MAX_THRESHOLD = 0.016;
 
 const GESTURE_NAMES = Object.freeze({
   Closed_Fist: "ROCK",
@@ -63,7 +69,8 @@ let lastFrameTimestamp = null;
 function emptyTracker() {
   return {
     detected: false, gesture: "UNKNOWN", confidence: 0, centerX: null,
-    motionPoint: null, motion: 0,
+    motionPoint: null, motion: 0, motionHistory: [], shortMotion: 0,
+    settleThreshold: AUTO_SETTLE_MIN_THRESHOLD, settleCount: 0, isSettled: false,
     sequenceGesture: null, sequenceCount: 0, sequenceStartTimestamp: null, lastLocked: null,
   };
 }
@@ -157,11 +164,26 @@ function selectCandidateForPlayer(candidates, player) {
   })[0];
 }
 
+function resetMotionAnalysis(track) {
+  track.motionPoint = null;
+  track.motion = 0;
+  track.motionHistory = [];
+  track.shortMotion = 0;
+  track.settleThreshold = AUTO_SETTLE_MIN_THRESHOLD;
+  track.settleCount = 0;
+  track.isSettled = false;
+}
+
+function percentile(values, ratio) {
+  if (!values.length) return 0;
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.min(ordered.length - 1, Math.floor((ordered.length - 1) * ratio))];
+}
+
 function updateMotion(track, candidate) {
   const landmarks = candidate?.landmarks;
   if (!landmarks?.length) {
-    track.motionPoint = null;
-    track.motion = 0;
+    resetMotionAnalysis(track);
     return 0;
   }
   // Averaging the wrist and four fingertips catches both the normal janken
@@ -175,14 +197,36 @@ function updateMotion(track, candidate) {
   const motion = previous ? Math.hypot(anchor.x - previous.x, anchor.y - previous.y) : 0;
   track.motionPoint = anchor;
   track.motion = motion;
+  track.motionHistory.push(motion);
+  if (track.motionHistory.length > AUTO_MOTION_HISTORY_SIZE) track.motionHistory.shift();
+
+  const recent = track.motionHistory.slice(-AUTO_SETTLE_WINDOW);
+  track.shortMotion = recent.reduce((sum, amount) => sum + amount, 0) / recent.length;
+  // The lower part of the current history approximates this camera's normal
+  // hand-tracking jitter. Its bounded multiple creates a per-device/scene
+  // quiet threshold without requiring that every frame be exactly still.
+  const noiseFloor = percentile(track.motionHistory, 0.25);
+  track.settleThreshold = Math.min(
+    AUTO_SETTLE_MAX_THRESHOLD,
+    Math.max(AUTO_SETTLE_MIN_THRESHOLD, noiseFloor * AUTO_SETTLE_NOISE_MULTIPLIER),
+  );
+  const hasSettleWindow = recent.length === AUTO_SETTLE_WINDOW;
+  const quiet = hasSettleWindow && track.shortMotion <= track.settleThreshold;
+  track.settleCount = quiet ? track.settleCount + 1 : 0;
+  track.isSettled = track.settleCount >= AUTO_SETTLE_FRAME_COUNT;
   return motion;
+}
+
+function movementStartThreshold(track) {
+  // A sudden movement needs to be meaningfully above the adaptive noise floor.
+  return Math.max(AUTO_MOTION_START_FLOOR, track.settleThreshold * 2.2);
 }
 
 function startAutoCapture(timestamp) {
   autoMotionTriggered = true;
   goTimestamp = timestamp;
   resetForGo();
-  setStatus("動きを検知しました。手形が止まり、3フレーム安定したら自動判定します。");
+  setStatus("動きを検知しました。動きが減衰して手形が安定したら自動判定します。");
 }
 
 function winnerFor(aGesture, bGesture) {
@@ -257,7 +301,7 @@ function logDebugFrame(timestamp, candidates, selections) {
     ...candidates.map((candidate) => {
       const assigned = selections.A?.index === candidate.index ? "A" : selections.B?.index === candidate.index ? "B" : "outside";
       const tracker = assigned === "A" || assigned === "B" ? trackers[assigned] : null;
-      return `[${assigned}] hand=${candidate.index} wrist/screenX=${candidate.centerX.toFixed(3)} raw=${candidate.rawName} mapped=${candidate.gesture} confidence=${(candidate.confidence * 100).toFixed(1)}% motion=${(tracker?.motion ?? 0).toFixed(3)} streak=${tracker?.sequenceCount ?? 0}/${STABLE_FRAME_COUNT}\n  landmarks: ${landmarksForLog(candidate.landmarks)}`;
+      return `[${assigned}] hand=${candidate.index} wrist/screenX=${candidate.centerX.toFixed(3)} raw=${candidate.rawName} mapped=${candidate.gesture} confidence=${(candidate.confidence * 100).toFixed(1)}% motion=${(tracker?.motion ?? 0).toFixed(3)} shortMotion=${(tracker?.shortMotion ?? 0).toFixed(3)} settle≤${(tracker?.settleThreshold ?? 0).toFixed(3)} settled=${tracker?.isSettled ?? false} (${tracker?.settleCount ?? 0}/${AUTO_SETTLE_FRAME_COUNT}) streak=${tracker?.sequenceCount ?? 0}/${STABLE_FRAME_COUNT}\n  landmarks: ${landmarksForLog(candidate.landmarks)}`;
     }),
   ].join("\n");
   debugLines.unshift(output);
@@ -282,8 +326,10 @@ function processFrame(timestamp) {
       A: updateMotion(trackers.A, selections.A),
       B: updateMotion(trackers.B, selections.B),
     };
-    const autoMotionThisFrame = phase === "auto" && Object.values(motion).some((amount) => amount >= AUTO_MOTION_THRESHOLD);
-    if (phase === "auto" && !autoMotionTriggered && autoMotionThisFrame) startAutoCapture(timestamp);
+    const autoMotionStartThisFrame = phase === "auto" && ["A", "B"].some(
+      (player) => motion[player] >= movementStartThreshold(trackers[player]),
+    );
+    if (phase === "auto" && !autoMotionTriggered && autoMotionStartThisFrame) startAutoCapture(timestamp);
 
     for (const player of ["A", "B"]) {
       const candidate = selections[player];
@@ -295,7 +341,9 @@ function processFrame(timestamp) {
       // A callback that was queued just before GO must not seed a post-GO
       // sequence, even on an unusually busy browser event loop.
       const eligibleForTiming = phase !== "running" || timestamp >= goTimestamp;
-      const autoCandidate = autoMotionTriggered && !autoMotionThisFrame ? candidate : null;
+      // AUTO JUDGE accepts a recognised hand only after its rolling movement
+      // has settled; slight natural tremor remains acceptable.
+      const autoCandidate = autoMotionTriggered && track.isSettled ? candidate : null;
       const candidateForStability = phase === "auto" ? autoCandidate : candidate;
       updateStability(player, eligibleForTiming ? candidateForStability : null, timestamp);
     }
@@ -388,10 +436,7 @@ function startAutoJudge() {
   goTimestamp = null;
   autoMotionTriggered = false;
   resetForGo();
-  for (const player of ["A", "B"]) {
-    trackers[player].motionPoint = null;
-    trackers[player].motion = 0;
-  }
+  for (const player of ["A", "B"]) resetMotionAnalysis(trackers[player]);
   ui.countdown.hidden = true;
   ui.result.hidden = true;
   ui.start.disabled = true;
