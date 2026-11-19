@@ -4,8 +4,10 @@
 const MEDIAPIPE_VERSION = "0.10.21";
 const TASKS_VISION_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}`;
 const GESTURE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task";
-const GESTURE_CONFIDENCE_THRESHOLD = 0.70;
-const STABLE_FRAME_COUNT = 3;
+// The game only permits rock, scissors, or paper, so favour a quick, lenient
+// classification over rejecting an ambiguous but usable hand shape.
+const GESTURE_CONFIDENCE_THRESHOLD = 0.20;
+const STABLE_FRAME_COUNT = 2;
 const REQUESTED_WIDTH = 1280;
 const REQUESTED_HEIGHT = 720;
 const MIRROR_PREVIEW = true;
@@ -14,8 +16,8 @@ const DEBUG_LOG_LIMIT = 40;
 // than requiring a perfectly motionless hand. All values are normalized to the frame.
 const AUTO_MOTION_START_FLOOR = 0.014;
 const AUTO_MOTION_HISTORY_SIZE = 24;
-const AUTO_SETTLE_WINDOW = 4;
-const AUTO_SETTLE_FRAME_COUNT = 3;
+const AUTO_SETTLE_WINDOW = 3;
+const AUTO_SETTLE_FRAME_COUNT = 2;
 const AUTO_SETTLE_NOISE_MULTIPLIER = 2.4;
 const AUTO_SETTLE_MIN_THRESHOLD = 0.005;
 const AUTO_SETTLE_MAX_THRESHOLD = 0.016;
@@ -131,16 +133,35 @@ function updateFrameTelemetry(timestamp) {
   ui.frameInterval.textContent = `${average.toFixed(1)} ms`;
 }
 
-function mapGesture(categories) {
+function landmarkFallbackGesture(landmarks) {
+  const wrist = landmarks?.[0];
+  if (!wrist) return null;
+  const fingerPairs = [[6, 8], [10, 12], [14, 16], [18, 20]];
+  const extended = fingerPairs.map(([pip, tip]) => {
+    const pipDistance = Math.hypot(landmarks[pip].x - wrist.x, landmarks[pip].y - wrist.y);
+    const tipDistance = Math.hypot(landmarks[tip].x - wrist.x, landmarks[tip].y - wrist.y);
+    return tipDistance > pipDistance * 1.12;
+  });
+  const [index, middle, ring, pinky] = extended;
+  const count = extended.filter(Boolean).length;
+  if (count >= 3) return { gesture: "PAPER", confidence: 0.45, rawName: "landmark_fallback" };
+  if (index && middle && !ring && !pinky) return { gesture: "SCISSORS", confidence: 0.45, rawName: "landmark_fallback" };
+  if (count <= 1) return { gesture: "ROCK", confidence: 0.45, rawName: "landmark_fallback" };
+  // With this app's constrained input, ambiguous two-finger shapes are closer
+  // to scissors than an unknown state, which keeps timing capture responsive.
+  return { gesture: "SCISSORS", confidence: 0.35, rawName: "landmark_fallback" };
+}
+
+function mapGesture(categories, landmarks) {
   const category = categories?.[0];
-  if (!category) return { gesture: "UNKNOWN", confidence: 0, rawName: "none" };
+  if (!category) return landmarkFallbackGesture(landmarks) || { gesture: "UNKNOWN", confidence: 0, rawName: "none" };
   const rawName = category.categoryName || category.displayName || "unknown";
   const confidence = Number(category.score) || 0;
   const gesture = GESTURE_NAMES[rawName] || "UNKNOWN";
-  if (gesture === "UNKNOWN" || confidence < GESTURE_CONFIDENCE_THRESHOLD) {
-    return { gesture: "UNKNOWN", confidence, rawName };
+  if (gesture !== "UNKNOWN" && confidence >= GESTURE_CONFIDENCE_THRESHOLD) {
+    return { gesture, confidence, rawName };
   }
-  return { gesture, confidence, rawName };
+  return landmarkFallbackGesture(landmarks) || { gesture: "UNKNOWN", confidence, rawName };
 }
 
 function handCenter(landmarks) {
@@ -152,7 +173,7 @@ function handCenter(landmarks) {
 
 function makeCandidate(landmarks, categories, index) {
   const centerX = handCenter(landmarks);
-  return centerX === null ? null : { index, landmarks, centerX, ...mapGesture(categories) };
+  return centerX === null ? null : { index, landmarks, centerX, ...mapGesture(categories, landmarks) };
 }
 
 function selectCandidateForPlayer(candidates, player) {
@@ -250,7 +271,7 @@ function updateStability(player, candidate, timestamp) {
     track.sequenceCount = 1;
     track.sequenceStartTimestamp = timestamp;
   }
-  // The stored time is intentionally the first frame of the three-frame run.
+  // The stored time is intentionally the first frame of the stable run.
   if (track.sequenceCount === STABLE_FRAME_COUNT) {
     track.lastLocked = {
       gesture: candidate.gesture,
@@ -460,12 +481,17 @@ function finishMeasurement() {
   const winner = winnerFor(a.gesture, b.gesture);
   ui.resultLabel.textContent = completedAutomatically ? "AUTO JUDGEMENT COMPLETE" : "MEASUREMENT COMPLETE";
   ui.winnerMessage.textContent = winner;
-  ui.difference.textContent = `${difference >= 0 ? "+" : ""}${formatMs(difference)}`;
+  ui.difference.textContent = formatMs(Math.abs(difference));
   if (Math.abs(difference) < 0.05) {
     ui.laterMessage.textContent = "SAME CAPTURE FRAME (within displayed precision)";
-  } else {
+  } else if (winner === "DRAW — SAME HAND") {
     const later = difference > 0 ? "PLAYER B" : "PLAYER A";
     ui.laterMessage.textContent = `${later} WAS ${formatMs(Math.abs(difference))} LATER`;
+  } else {
+    const winnerTimestamp = winner === "PLAYER A WINS" ? a.timestamp : b.timestamp;
+    const loserTimestamp = winner === "PLAYER A WINS" ? b.timestamp : a.timestamp;
+    const relation = winnerTimestamp < loserTimestamp ? "EARLIER" : "LATER";
+    ui.laterMessage.textContent = `WINNER WAS ${formatMs(Math.abs(difference))} ${relation}`;
   }
   ui.result.hidden = false;
   ui.start.disabled = false;
@@ -489,7 +515,10 @@ function resetTest() {
   ui.auto.disabled = !cameraReady;
   ui.reset.disabled = !cameraReady;
   updateAllPlayerUI();
-  if (cameraReady) setStatus("リセットしました。START TESTで測定できます。");
+  if (cameraReady) {
+    setStatus("リセットしました。自動判定を再開します。");
+    window.requestAnimationFrame(startAutoJudge);
+  }
 }
 
 async function enableCamera() {
@@ -531,13 +560,17 @@ async function enableCamera() {
     const settings = cameraStream.getVideoTracks()[0]?.getSettings?.() || {};
     ui.cameraFps.textContent = settings.frameRate ? `${Number(settings.frameRate).toFixed(1)}` : "not reported";
     cameraReady = true;
+    document.body.classList.add("camera-active");
     ui.placeholder.hidden = true;
     ui.enableCamera.textContent = "CAMERA READY";
     ui.start.disabled = false;
     ui.auto.disabled = false;
     ui.reset.disabled = false;
-    setStatus("カメラ準備完了。中央線の左右へ一人ずつ入ってください。");
+    setStatus("カメラ準備完了。自動判定を開始します。");
     startFrameLoop();
+    // A single camera-permission tap is enough for normal use. The app now
+    // watches for the next janken motion without requiring a START button.
+    window.requestAnimationFrame(startAutoJudge);
   } catch (error) {
     const hints = {
       NotAllowedError: "カメラ権限が拒否されました。ブラウザ設定で許可してください。",
@@ -557,9 +590,9 @@ async function initialiseRecognizer() {
     const recognizerOptions = {
       runningMode: "VIDEO",
       numHands: 2,
-      minHandDetectionConfidence: 0.55,
-      minHandPresenceConfidence: 0.55,
-      minTrackingConfidence: 0.55,
+      minHandDetectionConfidence: 0.35,
+      minHandPresenceConfidence: 0.35,
+      minTrackingConfidence: 0.35,
     };
     try {
       recognizer = await GestureRecognizer.createFromOptions(vision, {

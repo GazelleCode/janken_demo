@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main class="app-shell">
+    <main class="app-shell camera-only">
       <header class="app-header">
         <p class="eyebrow">ON-DEVICE CAMERA EXPERIMENT</p>
         <h1>JANKEN TIMING TEST</h1>
@@ -70,7 +70,7 @@
           <output id="winner-message">—</output>
         </div>
         <div class="difference-block">
-          <span>TIME DIFFERENCE (B − A)</span>
+          <span id="time-gap-label">WIN / LOSS TIME GAP</span>
           <output id="time-difference">—</output>
           <p id="later-message">—</p>
         </div>

@@ -148,3 +148,91 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   .debug-section { grid-area: debug; margin-top: 2px; }
   #debug-log { max-height: 150px; }
 }
+
+/* Presentation mode: the camera fills the entire UI. Status, the winner and
+   timing gap are HUD layers, not separate panels below the image. */
+.camera-only {
+  width: 100vw;
+  min-height: 100dvh;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.camera-only .camera-section { position: fixed; inset: 0; z-index: 0; }
+.camera-only .camera-frame { width: 100%; height: 100%; aspect-ratio: auto; max-height: none; border: 0; border-radius: 0; box-shadow: none; }
+.camera-only #camera, .camera-only #overlay { object-fit: cover; }
+.camera-only .player-zone { top: 8px; padding: 8px 11px; text-shadow: 0 1px 5px #000; }
+.camera-only .privacy-note,
+.camera-only .live-cards,
+.camera-only .telemetry,
+.camera-only .resolution-note,
+.camera-only .debug-section { display: none; }
+
+.camera-only .app-header {
+  position: fixed;
+  z-index: 8;
+  right: 12px;
+  bottom: 56px;
+  left: 12px;
+  margin: 0;
+  pointer-events: none;
+}
+.camera-only .eyebrow,
+.camera-only h1,
+.camera-only .orientation-hint { display: none; }
+.camera-only .app-status {
+  margin: 0;
+  min-height: 0;
+  color: #f4f9ff;
+  font-size: .75rem;
+  font-weight: 800;
+  line-height: 1.35;
+  text-align: center;
+  text-shadow: 0 2px 6px #000;
+}
+
+.camera-only .controls {
+  position: fixed;
+  z-index: 9;
+  right: 12px;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  left: 12px;
+  display: flex;
+  justify-content: center;
+  margin: 0;
+}
+.camera-only .controls button { min-width: 136px; min-height: 40px; background: #07111de6; border-color: #b9d6ec99; color: #fff; backdrop-filter: blur(8px); }
+.camera-only #start-test,
+.camera-only #auto-judge,
+.camera-only #reset-test { display: none; }
+body.camera-active .camera-only #enable-camera { display: none; }
+body.camera-active .camera-only #reset-test { display: inline-flex; align-items: center; justify-content: center; }
+
+.camera-only .result-panel {
+  position: fixed;
+  z-index: 7;
+  top: max(40px, env(safe-area-inset-top));
+  right: 14px;
+  left: 14px;
+  margin: 0;
+  padding: 10px 14px 12px;
+  border: 0;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #07111ee8, #07111ea6 76%, transparent);
+  box-shadow: none;
+}
+.camera-only .result-label,
+.camera-only .result-players { display: none; }
+.camera-only .judge-result { margin: 0; padding: 0; background: none; }
+.camera-only .judge-result span { display: none; }
+.camera-only .judge-result output { color: #fff; font-size: clamp(1.35rem, 6vw, 2.2rem); text-shadow: 0 2px 8px #000; }
+.camera-only .difference-block { gap: 1px; margin-top: 5px; }
+.camera-only .difference-block > span { color: #dcecff; font-size: .62rem; }
+.camera-only .difference-block output { color: var(--ok); font-size: clamp(2.25rem, 12vw, 4.2rem); text-shadow: 0 3px 10px #000; }
+.camera-only .difference-block p { margin: 0; color: #fff; font-size: .76rem; text-shadow: 0 1px 5px #000; }
+
+@media (orientation: landscape) {
+  .camera-only .result-panel { top: 34px; right: 20%; left: 20%; padding-top: 6px; }
+  .camera-only .judge-result output { font-size: clamp(1.2rem, 3.8vw, 2rem); }
+  .camera-only .difference-block output { font-size: clamp(2rem, 7vw, 3.7rem); }
+}
